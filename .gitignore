@@ -1,0 +1,24 @@
+.build/
+target/
+__pycache__/
+.DS_Store
+
+# Local session evidence, captures, and reports are never publication inputs.
+/Validation/
+/validation/
+/captures/
+/recordings/
+*.jsonl
+*.log
+
+# Local credentials and developer configuration.
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*.json
+auth.json
+settings.json
+.venv/

@@ -1,0 +1,26 @@
+[package]
+name = "voice-app"
+version = "0.2.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+# Versioned snapshot of Zed 93d745668805029476e6d7fbb19652116fed51de.
+gpui = { package = "gpui-pre", version = "=0.3.9", default-features = false }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.9", default-features = false, features = ["font-kit", "runtime_shaders"] }
+async-channel = "=2.5.0"
+base64 = "=0.22.1"
+libloading = "=0.8.9"
+raw-window-handle = "=0.6.2"
+serde_json = "=1.0.154"
+
+[profile.dev]
+debug = 1
+opt-level = 2
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
