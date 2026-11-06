@@ -1,0 +1,28 @@
+name: Checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  python:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - run: python3 -m unittest discover -s Tests -p test_bridge.py
+  rust:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - run: rustup default stable
+      - run: rustup component add rustfmt clippy
+      - run: sh scripts/cargo.sh fetch --locked
+      - run: sh scripts/cargo.sh fmt --check
+      - run: sh scripts/cargo.sh clippy --offline --locked --all-targets -- -D warnings
+      - run: sh scripts/build.sh
+      - run: sh scripts/cargo.sh test --offline --locked
+      - run: sh scripts/test-swift.sh

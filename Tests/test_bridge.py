@@ -60,6 +60,24 @@ class BrowserScopeTests(unittest.TestCase):
 
 
 class SessionTraceTests(unittest.TestCase):
+    def test_speech_stall_diagnostics_cannot_store_transcript_or_invalid_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trace = bridge.SessionTrace(Path(directory))
+            trace.record('speech_handoff_blocked', speaking=False, finalized=True, quietSeconds=4.12345,
+                         speechCount=2, finalizedSpeechCount=2, text='PRIVATE WORDS', error='PRIVATE ERROR')
+            trace.record('speech_handoff_blocked', speaking='PRIVATE', quietSeconds=float('nan'),
+                         finalizedSpeechCount='PRIVATE', speechCount=1 << 100)
+            trace.close()
+            raw = next(Path(directory).glob('voice-*.jsonl')).read_text()
+            self.assertNotIn('PRIVATE', raw)
+            rows = [json.loads(line) for line in raw.splitlines()]
+            self.assertEqual(rows[0]['quietSeconds'], 4.123)
+            self.assertIs(rows[0]['speaking'], False)
+            self.assertIs(rows[0]['finalized'], True)
+            self.assertNotIn('speaking', rows[1])
+            self.assertNotIn('quietSeconds', rows[1])
+            self.assertNotIn('speechCount', rows[1])
+
     def test_pointer_diagnostics_keep_only_bounded_numeric_geometry(self):
         with tempfile.TemporaryDirectory() as directory:
             trace = bridge.SessionTrace(Path(directory))
@@ -424,12 +442,16 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.settings_directory.cleanup)
         self.b = bridge.Bridge(settings_path=Path(self.settings_directory.name) / "settings.json")
         self.b.worker_thread = 'worker'
+        self.b.speech_backend = 'native'  # Existing native relay regression coverage.
         self.b.stopped = False
         self.calls = []
         self.epoch = 0
         self.text = 'Completed work stays here.'
         self.blocked = False
+        self.b.acoustic_ready = True
+        self.activity = {'success':True, 'available':True, 'speaking':False, 'speechCount':1, 'quietSeconds':3}
         async def ui(operation, **params):
+            if operation == 'speechActivity': return self.activity
             self.calls.append(operation)
             if operation in ('pause', 'stop'):
                 self.epoch += 1
@@ -684,6 +706,79 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(*self.b.tasks)
             self.assertEqual(routed, ['Make a checklist'])
             self.assertTrue(any(c.args == ('transcript',) and c.kwargs.get('text') == 'Make a checklist' and c.kwargs.get('partial') for c in emit.call_args_list))
+
+    async def test_caption_delivery_gap_does_not_split_one_spoken_request(self):
+        from unittest.mock import patch
+        self.activity['speaking'] = True
+        self.b.voice_live = self.b.hearing = True
+        self.b.voice_thread, self.b.session = 'voice', 'session'
+        self.b.input_item = ('session','input')
+        routed = []
+        async def route(text, *args): routed.append(text)
+        self.b.voice_utterance = route
+        async def delta(text):
+            await self.b.on_event({'method':'thread/realtime/item/transcript/delta',
+                'params':{'threadId':'voice','itemId':'input','delta':text}})
+        with patch.object(bridge, 'TRANSCRIPT_IDLE_SECONDS', 0.02), patch.object(bridge, 'emit'):
+            await delta('Open the browser')
+            # Caption delivery pauses while the same spoken request continues.
+            await asyncio.sleep(0.04)
+            try:
+                self.assertEqual(routed, [], 'caption inactivity must not stand in for acoustic silence')
+                await delta(' and open TikTok')
+                self.activity.update(speaking=False, quietSeconds=0.4)
+                await self.b.submit_heard_request(generation=self.b.transcript_generation)
+                self.assertEqual(routed, [], 'brief acoustic pauses must not submit')
+                self.activity['quietSeconds'] = 1.2
+                await self.b.submit_heard_request(generation=self.b.transcript_generation)
+                self.assertEqual(routed, ['Open the browser and open TikTok'])
+                await self.b.on_event({'method':'thread/realtime/item/completed','params':{
+                    'threadId':'voice','item':{'type':'transcriptSegment','role':'user','id':'input',
+                    'realtimeSessionId':'session','text':'Open the browser and open TikTok'}}})
+                await asyncio.gather(*list(self.b.tasks))
+                self.assertEqual(routed, ['Open the browser and open TikTok'])
+            finally:
+                self.b.cancel_transcript_submit()
+
+    async def test_nonfunctioning_detector_explains_why_captions_are_not_sent(self):
+        from unittest.mock import patch
+        self.b.voice_live = self.b.hearing = True
+        self.b.voice_thread, self.b.session = 'voice', 'session'
+        self.b.input_item, self.b.input_text = ('session', 'input'), 'Open the browser'
+        self.activity.update(speechCount=0, quietSeconds=0)
+        with patch.object(bridge, 'emit') as emit:
+            for _ in range(2):
+                await self.b.submit_heard_request(generation=self.b.transcript_generation)
+            messages = [call for call in emit.call_args_list if call.args == ('voice',)]
+            self.assertEqual(len(messages), 1)
+            self.assertIn('Send heard request', messages[0].kwargs['message'])
+            self.assertNotIn('turn/start', self.calls)
+            self.assertTrue(self.b.hearing)
+            self.activity.update(speechCount=1, quietSeconds=3)
+            await self.b.submit_heard_request(generation=self.b.transcript_generation)
+        self.assertIn('turn/start', self.calls)
+
+    async def test_auto_send_requires_live_speech_detector_and_observed_silence(self):
+        from unittest.mock import patch
+        self.b.voice_live = True
+        self.b.voice_thread, self.b.session = 'voice', 'session'
+        self.b.input_item, self.b.input_text = ('session','input'), 'Complete request'
+        routed = []
+        async def route(text, *args): routed.append(text)
+        self.b.voice_utterance = route
+        with patch.object(bridge, 'emit'):
+            for fields in [dict(available=False), dict(success=False), dict(speaking=True),
+                           dict(speechCount=0), dict(quietSeconds=0.8)]:
+                original = dict(self.activity)
+                self.activity.update(fields)
+                await self.b.submit_heard_request(generation=self.b.transcript_generation)
+                self.assertEqual(routed, [], fields)
+                self.activity = original
+            self.b.acoustic_ready = False
+            await self.b.submit_heard_request(generation=self.b.transcript_generation)
+            self.assertEqual(routed, [])
+            await self.b.command({'type':'submitTranscript'})
+            self.assertEqual(routed, ['Complete request'])
 
     async def test_delayed_caption_words_remain_one_request(self):
         from unittest.mock import patch
@@ -1595,6 +1690,122 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.calls, ['pause', 'observe', 'resume', 'turn/start'])
         self.assertIn(self.text, self.prompt)
 
+    async def test_100_terminal_interrupt_races_preserve_corrections_and_stop(self):
+        from unittest.mock import patch
+        import time
+        durations = []
+        original = self.b.rpc.request
+        for trial in range(100):
+            turn = 'finished-' + str(trial)
+            self.calls.clear()
+            self.b.active_turn, self.b.stopped, self.blocked = turn, False, False
+            self.b.turn_done.clear()
+            async def raced(method, params, **kwargs):
+                if method == 'turn/interrupt':
+                    await self.b.on_event({'method':'turn/completed','params':{
+                        'threadId':'worker','turn':{'id':turn,'status':'interrupted'}}})
+                    raise RuntimeError('Turn already ended')
+                return await original(method, params, **kwargs)
+            self.b.rpc.request = raced
+            started = time.perf_counter()
+            with patch.object(bridge, 'emit') as emit:
+                if trial % 2:
+                    await self.b.command({'type':'stop'})
+                    self.assertTrue(self.b.stopped)
+                    self.assertNotIn('resume', self.calls)
+                    self.assertNotIn('turn/start', self.calls)
+                else:
+                    await self.b.utterance('Correct the heading')
+                    self.assertEqual(self.calls, ['pause','observe','resume','turn/start'])
+                durations.append((time.perf_counter() - started) * 1000)
+                self.assertFalse(any(c.args == ('failure',) for c in emit.call_args_list))
+                self.calls.clear()
+                await self.b.tool({'id':trial,'params':{'threadId':'worker','turnId':turn,
+                    'tool':'desktop','arguments':{'operation':'key','key':'return','epoch':1,'revision':'stale'}}})
+                self.assertFalse(any(c in ('key','press','click','resume','turn/start') for c in self.calls if isinstance(c,str)))
+        print(json.dumps({'metric':'terminal_interrupt_races','trials':100,
+                          'false_failures':0,'stale_action_dispatches':0,
+                          'controller_p95_ms':round(sorted(durations)[94],3)}))
+
+    async def test_100_canonical_finals_route_once_without_local_delay(self):
+        from unittest.mock import patch
+        import time
+        routed, durations = [], []
+        self.b.voice_live = True
+        self.b.voice_thread, self.b.session = 'voice', 'session'
+        async def route(text, *args): routed.append(text)
+        self.b.voice_utterance = route
+        with patch.object(bridge, 'emit'):
+            for trial in range(100):
+                event = {'method':'thread/realtime/item/completed','params':{'threadId':'voice',
+                    'item':{'type':'transcriptSegment','role':'user','id':str(trial),
+                            'realtimeSessionId':'session','text':'Command ' + str(trial)}}}
+                started = time.perf_counter()
+                await self.b.on_event(event)
+                await self.b.on_event(event)
+                await asyncio.gather(*list(self.b.tasks))
+                durations.append((time.perf_counter()-started)*1000)
+        self.assertEqual(routed, ['Command '+str(i) for i in range(100)])
+        p95 = sorted(durations)[94]
+        self.assertLess(p95, 50, 'bridge-only final transcript routing exceeded local budget')
+        print(json.dumps({'metric':'canonical_final_routing','trials':100,'routed_once':100,
+                          'bridge_p95_ms':round(p95,3)}))
+
+    async def test_watchdog_measures_inactivity_not_segment_age(self):
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        self.b.voice_live = self.b.hearing = True
+        self.b.voice_thread, self.b.session = 'voice', 'session'
+        self.b.input_item = ('session','input')
+        clock, wakeups, warned, packets = [100.0], [], [], []
+        self.b.transcript_progress_at = clock[0]
+        async def sleep(delay):
+            wakeups.append(delay)
+            if len(wakeups) <= 100:
+                clock[0] += delay - 0.024
+                packets.append(clock[0])
+                await self.b.on_event({'method':'thread/realtime/item/transcript/delta',
+                    'params':{'threadId':'voice','itemId':'input','delta':'still speaking'}})
+                clock[0] += 0.024
+            else:
+                clock[0] += delay
+        def emit(kind, **fields):
+            if kind == 'voice' and fields.get('state') == 'transcribing':warned.append(clock[0])
+        fake_time = SimpleNamespace(monotonic=lambda:clock[0], monotonic_ns=bridge.time.monotonic_ns)
+        with patch.object(bridge, 'time', fake_time), patch.object(bridge.asyncio, 'sleep', sleep), patch.object(bridge, 'emit', emit):
+            await self.b.transcript_watchdog(self.b.input_item)
+        self.b.cancel_transcript_submit()
+        self.assertEqual(len(warned), 1)
+        self.assertEqual(len(packets), 100)
+        self.assertAlmostEqual(warned[0] - packets[-1], 8, places=3)
+        self.assertEqual(len(wakeups), 101)
+
+    async def test_duplicate_watchdogs_emit_one_warning_and_respect_revocation(self):
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        for revoked in (None, 'muted', 'stopped', 'new-item', 'ended'):
+            self.b.voice_live = self.b.hearing = True
+            self.b.stopped = self.b.microphone_muted = False
+            self.b.input_item = ('session','input')
+            self.b.transcript_progress_at = 100.0
+            clock, sleepers = [100.0], []
+            release = asyncio.Event()
+            async def sleep(delay):
+                sleepers.append(delay)
+                if len(sleepers) == 2:
+                    clock[0] = 108.0
+                    if revoked == 'muted': self.b.microphone_muted = True
+                    if revoked == 'stopped': self.b.stopped = True
+                    if revoked == 'new-item': self.b.input_item = ('session','new')
+                    if revoked == 'ended': self.b.voice_live = False
+                    release.set()
+                await release.wait()
+            fake_time = SimpleNamespace(monotonic=lambda:clock[0], monotonic_ns=bridge.time.monotonic_ns)
+            with patch.object(bridge, 'time', fake_time), patch.object(bridge.asyncio, 'sleep', sleep), patch.object(bridge, 'emit') as emit:
+                await asyncio.gather(self.b.transcript_watchdog(('session','input')),
+                                     self.b.transcript_watchdog(('session','input')))
+            self.assertEqual(len(emit.call_args_list), 1 if revoked is None else 0, revoked)
+
     async def test_cancellation_timeout_never_reopens_gui(self):
         self.b.active_turn = 'old-turn'
         async def failed_request(*args, **kwargs):
@@ -1621,6 +1832,223 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         await self.b.utterance('Continue', explicit=True)
         self.assertEqual(self.calls, ['pause', 'observe', 'resume'])
         self.assertTrue(self.b.stopped)
+
+    async def test_explicit_open_running_app_is_local_but_multistep_request_uses_worker(self):
+        original = self.b.ui
+        async def ui(operation, **params):
+            result = await original(operation, **params)
+            if operation == 'observe':
+                result['observation']['apps'] = [{'name': 'Zeron', 'pid': 42}]
+            if operation == 'activate':
+                return {'success': True, 'observation': {'pid': 42}}
+            return result
+        self.b.ui = ui
+        await self.b.utterance('Open Zeron')
+        self.assertNotIn('turn/start', self.calls)
+        self.assertEqual(self.b.last_local_result, 'Switched to Zeron.')
+        self.calls.clear()
+        await self.b.utterance('Open Zeron and change the theme')
+        self.assertIn('turn/start', self.calls)
+
+    async def test_activate_bundle_id_is_rejected_before_dispatch_with_usable_recovery(self):
+        self.b.active_turn = 'turn'
+        await self.b.tool({'id': 7, 'params': {'threadId': 'worker', 'turnId': 'turn', 'tool': 'desktop',
+            'arguments': {'operation': 'activate', 'bundleID': 'test.app', 'epoch': 1, 'revision': 'fresh'}}})
+        self.assertNotIn('activate', self.calls)
+        result = self.calls[-1]['result']
+        self.assertFalse(result['success'])
+        self.assertIn('launchApp', result['contentItems'][0]['text'])
+
+    async def test_local_speech_starts_without_native_voice_or_realtime_thread(self):
+        from unittest.mock import patch
+        self.b.speech_backend = 'apple'
+        authenticated, started, capture = [], [], []
+        async def authenticate(expected): authenticated.append(expected)
+        async def start_thread(instructions, tools):
+            started.append(tools)
+            return 'local-worker'
+        async def ui(operation, **params):
+            capture.append((operation, params))
+            return {'success': True}
+        async def monitor(): pass
+        self.b.authenticate, self.b.start_thread, self.b.ui = authenticate, start_thread, ui
+        self.b.monitor_local_speech = monitor
+        with patch.object(bridge, 'emit'):
+            await self.b.open_voice('expected@example.test')
+        self.assertEqual(authenticated, ['expected@example.test'])
+        self.assertEqual(started, [[bridge.TOOL]])
+        self.assertEqual(capture, [('localSpeech', {'action': 'start', 'muted': False})])
+        self.assertIsInstance(self.b.native, bridge.LocalAudio)
+        self.assertTrue(self.b.voice_live)
+        self.assertNotIn('thread/realtime/start', self.calls)
+
+    async def test_local_speech_consumes_whole_ready_request_once(self):
+        from unittest.mock import patch
+        self.b.speech_backend = 'apple'
+        self.b.voice_live, self.b.hearing = True, True
+        self.b.voice_thread, self.b.session = 'local-session', 'session'
+        state = {'success': True, 'ready': False, 'text': 'Open a tab and type hello', 'version': 4}
+        actions, routed = [], []
+        async def ui(operation, **params):
+            actions.append(params['action'])
+            if params['action'] == 'consume':
+                if params['version'] != state['version']: return {'success': False}
+                state.update(text='', version=5)
+            return dict(state)
+        async def route(text, *args): routed.append(text)
+        self.b.ui, self.b.voice_utterance = ui, route
+        self.b.native = bridge.LocalAudio(ui)
+        with patch.object(bridge, 'emit'):
+            await self.b.submit_local_request()
+            self.assertEqual(routed, [])
+            state['ready'] = True
+            await asyncio.gather(self.b.submit_local_request(), self.b.submit_local_request())
+            await asyncio.gather(*self.b.tasks)
+            await self.b.submit_local_request()
+        self.assertEqual(routed, ['Open a tab and type hello'])
+        self.assertEqual(actions.count('consume'), 1)
+        self.assertFalse(self.b.hearing)
+
+    async def test_local_consumption_cannot_route_after_stop_during_ack(self):
+        self.b.voice_live = True
+        self.b.session = 'session'
+        async def ui(operation, **params):
+            if params['action'] == 'consume':
+                self.b.stopped = True
+                self.b.interaction += 1
+            return {'success': True, 'ready': True, 'text': 'Do not run', 'version': 1}
+        self.b.ui = ui
+        self.b.native = bridge.LocalAudio(ui)
+        await self.b.submit_local_request()
+        self.assertEqual(self.calls, [])
+        self.assertFalse(self.b.local_submit_pending)
+
+    async def test_stalled_local_handoff_explains_wait_once_without_dispatch(self):
+        from unittest.mock import patch, Mock
+        self.b.voice_live = self.b.hearing = True
+        self.b.trace = Mock()
+        reads = 0
+        async def ui(operation, **params):
+            nonlocal reads
+            reads += 1
+            if reads > 1:
+                self.b.transcript_progress_at = bridge.time.monotonic() - 5
+            return {'success': True, 'text': 'PRIVATE WORDS', 'version': 2, 'ready': False,
+                    'speaking': False, 'quietSeconds': 5, 'speechCount': 1, 'finalized': False,
+                    'finalizedSpeechCount': 1}
+        async def sleep(delay):
+            if reads == 3: self.b.voice_live = False
+        self.b.ui = ui
+        self.b.native = bridge.LocalAudio(ui)
+        with patch.object(bridge.asyncio, 'sleep', sleep), patch.object(bridge, 'emit') as emit:
+            await self.b.monitor_local_speech()
+        messages = [c for c in emit.call_args_list if c.args == ('voice',) and c.kwargs.get('state') == 'transcribing']
+        self.assertEqual(len(messages), 1)
+        self.assertIn('Send heard request', messages[0].kwargs['message'])
+        records = [c for c in self.b.trace.record.call_args_list if c.args == ('speech_handoff_blocked',)]
+        self.assertEqual(len(records), 1)
+        self.assertNotIn('PRIVATE WORDS', str(records))
+        self.assertEqual(self.calls, [])
+
+    async def test_microphone_noise_without_recognized_words_does_not_pause_work(self):
+        from unittest.mock import patch
+        self.b.voice_live = True
+        self.b.active_turn = 'running-task'
+        original = self.b.ui
+        async def ui(operation, **params):
+            if operation == 'localSpeech':
+                return {'success': True, 'speaking': True, 'text': '', 'version': 0}
+            return await original(operation, **params)
+        async def sleep(delay): self.b.voice_live = False
+        self.b.ui = ui
+        self.b.native = bridge.LocalAudio(ui)
+        with patch.object(bridge.asyncio, 'sleep', sleep):
+            await self.b.monitor_local_speech()
+            await asyncio.gather(*self.b.tasks)
+        self.assertFalse(self.b.hearing)
+        self.assertNotIn('pause', self.calls)
+        self.assertEqual(self.b.active_turn, 'running-task')
+
+    async def test_local_monitor_discards_status_from_before_a_mute_transition(self):
+        from unittest.mock import patch
+        self.b.voice_live = True
+        calls = 0
+        async def ui(operation, **params):
+            nonlocal calls
+            self.assertEqual(operation, 'localSpeech')
+            calls += 1
+            if calls == 1:
+                self.b.native.revision += 1
+                return {'success': False, 'error': 'Stale capture state during mute'}
+            return {'success': True, 'text': '', 'version': 2}
+        async def sleep(delay): self.b.voice_live = False
+        self.b.ui = ui
+        self.b.native = bridge.LocalAudio(ui)
+        with patch.object(bridge.asyncio, 'sleep', sleep):
+            await self.b.monitor_local_speech()
+        self.assertEqual(calls, 2)
+        self.assertFalse(self.b.stopped)
+
+    async def test_local_mute_and_unmute_keep_worker_session_and_do_not_call_realtime(self):
+        from unittest.mock import patch
+        self.b.voice_live = True
+        self.b.session, self.b.voice_thread = 'session', 'local-session'
+        self.b.active_turn = 'working-turn'
+        actions = []
+        async def ui(operation, **params):
+            actions.append(params)
+            return {'success': True}
+        self.b.native = bridge.LocalAudio(ui)
+        with patch.object(bridge, 'emit'):
+            await self.b.command({'type': 'audioControls', 'muted': True})
+            await self.b.command({'type': 'audioControls', 'muted': False})
+        self.assertEqual(self.b.active_turn, 'working-turn')
+        self.assertEqual(self.b.session, 'session')
+        self.assertEqual(self.b.worker_thread, 'worker')
+        self.assertEqual([a['muted'] for a in actions], [True, False])
+        self.assertEqual(self.calls, [])
+
+    async def test_authentication_disables_coding_context_only_for_app_threads(self):
+        async def request(method, params, **kwargs):
+            if method == 'account/read':
+                return {'account': {'type': 'chatgpt', 'email': 'expected@example.test'}}
+            if method == 'config/read':
+                return {'config': {'mcp_servers': {'personal': {}}}}
+            if method == 'skills/list':
+                return {'data': [{'skills': [{'path': '/tmp/skill/SKILL.md'},
+                                            {'path': '/tmp/skill/SKILL.md'}]}]}
+            if method == 'thread/realtime/listVoices':
+                return {'voices': {'v3': ['arbor']}}
+            raise AssertionError(method)
+        self.b.rpc.request = request
+        await self.b.authenticate('expected@example.test')
+        self.assertIs(self.b.disabled_config['skills.include_instructions'], False)
+        self.assertIs(self.b.disabled_config['mcp_servers.personal.enabled'], False)
+        self.assertEqual(self.b.disabled_config['project_doc_max_bytes'], 0)
+
+    async def test_worker_has_explicit_model_and_desktop_only_instructions(self):
+        captured = []
+        async def request(method, params, **kwargs):
+            captured.append(params)
+            return {'thread': {'id': 'isolated'}, 'modelProvider': 'openai', 'model': 'gpt-6-luna'}
+        self.b.rpc.request = request
+        await self.b.start_thread(bridge.WORKER_INSTRUCTIONS, [bridge.TOOL])
+        params = captured[0]
+        self.assertEqual(params['model'], 'gpt-6-luna')
+        self.assertEqual(params['baseInstructions'], bridge.WORKER_INSTRUCTIONS)
+        self.assertEqual(params['developerInstructions'], '')
+        self.assertEqual(params['config']['project_doc_max_bytes'], 0)
+        self.assertEqual(params['dynamicTools'], [bridge.TOOL])
+        self.assertEqual(params['sandbox'], 'read-only')
+
+    async def test_worker_model_mismatch_is_explicit_without_turn_dispatch(self):
+        async def request(method, params, **kwargs):
+            self.calls.append(method)
+            return {'thread': {'id': 'wrong'}, 'modelProvider': 'openai', 'model': 'gpt-6-astra'}
+        self.b.rpc.request = request
+        with self.assertRaisesRegex(RuntimeError, 'worker model'):
+            await self.b.start_thread(bridge.WORKER_INSTRUCTIONS, [bridge.TOOL])
+        self.assertEqual(self.calls, ['thread/start'])
 
     async def test_account_mismatch_stops_before_catalog_or_thread(self):
         async def account_request(method, params, **kwargs):

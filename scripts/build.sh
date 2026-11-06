@@ -8,6 +8,10 @@ case "${1-}" in
     --install) [ "$#" -eq 1 ] || { echo 'Usage: sh scripts/build.sh [--install]' >&2; exit 2; }; voice_app_install=true ;;
     *) echo 'Usage: sh scripts/build.sh [--install]' >&2; exit 2 ;;
 esac
+if [ "$(uname -s)" != Darwin ] || [ "$(uname -m)" != arm64 ]; then
+    echo 'This build currently supports Apple Silicon macOS only.' >&2
+    exit 1
+fi
 # Ordinary builds never request access to the signing key or replace the installed app.
 if [ "$voice_app_install" = true ]; then
     if /usr/bin/pgrep -x voice-app >/dev/null 2>&1; then
@@ -16,21 +20,23 @@ if [ "$voice_app_install" = true ]; then
     fi
     # A certificate-backed identity preserves the designated requirement across builds.
     # Check before touching the existing app so a missing identity cannot replace it.
-    voice_app_signing_identity=$(/usr/bin/security find-identity -v -p codesigning | /usr/bin/awk '/"Voice App Local Development"$/ { print $2 }')
+    voice_app_signing_name=${VOICE_APP_SIGNING_IDENTITY:-Voice App Local Development}
+    voice_app_signing_identity=$(/usr/bin/security find-identity -v -p codesigning | /usr/bin/awk -v name="$voice_app_signing_name" 'index($0, "\"" name "\"") { print $2 }')
     if [ -z "$voice_app_signing_identity" ]; then
-        echo 'Missing code-signing identity: Voice App Local Development.' >&2
-        echo 'Create the approved local Code Signing identity in your login keychain before rebuilding.' >&2
+        echo "Missing code-signing identity: $voice_app_signing_name" >&2
+        echo 'Set VOICE_APP_SIGNING_IDENTITY to the exact name of your Code Signing certificate.' >&2
         echo 'The existing app has been left untouched. Ad-hoc signing is disabled.' >&2
         exit 1
     fi
     if [ "$(printf '%s\n' "$voice_app_signing_identity" | /usr/bin/wc -l | /usr/bin/tr -d ' ')" != 1 ]; then
-        echo 'More than one Voice App Local Development identity exists. Select a single identity before rebuilding.' >&2
+        echo 'More than one matching signing identity exists. Select a unique certificate name.' >&2
         exit 1
     fi
 fi
 sh scripts/cargo.sh build --offline --locked
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Frameworks"
-/usr/bin/xcrun swiftc -target arm64-apple-macosx14.0 -swift-version 5 -O -emit-library -module-name VoiceDesktop -Xlinker -install_name -Xlinker @rpath/libVoiceDesktop.dylib -framework AppKit -framework AVFoundation -framework ApplicationServices -framework ScreenCaptureKit Sources/ActionGate.swift Sources/AgentCursor.swift Sources/DesktopWorker.swift Sources/DesktopAdapter.swift -o "$APP/Contents/Frameworks/libVoiceDesktop.dylib"
+sh scripts/build-icon.sh "$APP/Contents/Resources/VoiceApp.icns"
+/usr/bin/xcrun swiftc -target arm64-apple-macosx14.0 -swift-version 5 -O -emit-library -module-name VoiceDesktop -Xlinker -install_name -Xlinker @rpath/libVoiceDesktop.dylib -framework AppKit -framework AVFoundation -framework ApplicationServices -framework ScreenCaptureKit -framework CoreAudio -framework Speech Sources/LocalSpeech.swift Sources/ActionGate.swift Sources/AgentCursor.swift Sources/DesktopWorker.swift Sources/DesktopAdapter.swift -o "$APP/Contents/Frameworks/libVoiceDesktop.dylib"
 cp .build/rust-target/debug/voice-app "$APP/Contents/MacOS/voice-app"
 cp Sources/bridge.py "$APP/Contents/Resources/bridge.py"
 cat > "$APP/Contents/Info.plist" <<'PLIST'
@@ -40,9 +46,10 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleExecutable</key><string>voice-app</string>
 <key>CFBundleIdentifier</key><string>tech.kennezekiel.voice-app</string>
 <key>CFBundleName</key><string>Voice App</string>
-<key>CFBundleVersion</key><string>2</string>
+<key>CFBundleIconFile</key><string>VoiceApp.icns</string>
+<key>CFBundleVersion</key><string>4</string>
 <key>CFBundleShortVersionString</key><string>0.2</string>
-<key>NSMicrophoneUsageDescription</key><string>Voice App sends audio through your installed Codex native voice runtime to OpenAI using your ChatGPT account. Opening Voice App starts a session and microphone access. Stop session turns it off.</string>
+<key>NSMicrophoneUsageDescription</key><string>Voice App recognizes speech on this Mac using Apple speech. Recognized requests and desktop screenshots go to Codex through your ChatGPT account. Opening Voice App starts a session and microphone access. Stop session turns it off.</string>
 <key>NSAccessibilityUsageDescription</key><string>Voice App observes app controls and performs mouse and keyboard actions for your spoken desktop tasks while desktop sharing is enabled.</string>
 <key>NSScreenCaptureUsageDescription</key><string>Voice App sends display screenshots to Codex to understand your desktop and verify actions. Opening Voice App starts a session with desktop sharing. Stop session turns it off.</string>
 <key>NSHighResolutionCapable</key><true/>

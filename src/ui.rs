@@ -53,6 +53,7 @@ struct Session {
     message: String,
     email: String,
     plan: String,
+    local_speech: bool,
     connection: Connection,
     outcome: Option<Outcome>,
     outcome_current: bool,
@@ -76,9 +77,10 @@ impl Default for Session {
     fn default() -> Self {
         Self {
             status: "Paused".into(),
-            message: "Checking native Codex voice…".into(),
+            message: "Checking your Codex account…".into(),
             email: String::new(),
             plan: String::new(),
+            local_speech: true,
             connection: Connection::Disconnected,
             outcome: None,
             outcome_current: false,
@@ -238,7 +240,7 @@ impl Session {
         match self.connection {
             Connection::Connecting => "Connecting voice…",
             Connection::Disconnecting => "Ending the voice session…",
-            Connection::Disconnected if self.email.is_empty() => "Checking native Codex voice…",
+            Connection::Disconnected if self.email.is_empty() => "Checking your Codex account…",
             Connection::Disconnected if !self.shared => "Start your session",
             Connection::Disconnected => "Start your session",
             Connection::Connected if self.status == "Working" => "Working on your request",
@@ -292,6 +294,7 @@ impl Session {
                     .unwrap_or(5);
                 self.email = value["email"].as_str().unwrap_or("").into();
                 self.plan = value["plan"].as_str().unwrap_or("").into();
+                self.local_speech = value["speechBackend"].as_str() != Some("native");
                 self.message = "Start a session to speak and control your desktop. You can question, correct, or stop at any time.".into();
             }
             "settings" => {
@@ -824,7 +827,7 @@ impl Sidebar {
                 ""
             } else if self.session.audio_pending && matches!(action, Action::Mute | Action::Silence)
             {
-                "Waiting for native audio confirmation"
+                "Waiting for microphone confirmation"
             } else if self.session.email.is_empty() {
                 "Waiting for the Codex account check"
             } else if matches!(action, Action::Silence) && self.session.connection == Connection::Connected {
@@ -1156,7 +1159,11 @@ impl Render for Sidebar {
                 .line_height(relative(1.5)).child("Latest observation · updates after actions"))
             )
             .when(!self.session.shared, |view| view.child(div().text_size(px(12.)).text_color(rgb(MUTED))
-                .line_height(relative(1.5)).child("Start session connects your microphone and shares desktop snapshots with Codex. Stop session turns both off.")))
+                .line_height(relative(1.5)).child(if self.session.local_speech {
+                    "Speech is transcribed on this Mac. Recognized requests and desktop snapshots go to Codex. Stop session turns off capture and desktop sharing."
+                } else {
+                    "Start session connects native Codex voice and shares desktop snapshots. Stop session turns off capture and desktop sharing."
+                })))
             .when(self.details_open, |view| {
                 let account = if self.session.email.is_empty() { "Checking your Codex account…".into() }
                     else { format!("{} · ChatGPT {}", self.session.email, self.session.plan) };
@@ -1263,12 +1270,13 @@ impl Render for Sidebar {
                         true,
                         cx,
                     )))
-                    .child(
-                        div()
-                            .text_size(px(10.))
-                            .text_color(rgb(MUTED))
-                            .child("Subscription voice"),
-                    ),
+                    .child(div().text_size(px(10.)).text_color(rgb(MUTED)).child(
+                        if self.session.local_speech {
+                            "On-device speech"
+                        } else {
+                            "Subscription voice"
+                        },
+                    )),
             );
         root.child(header).child(body).child(footer)
     }

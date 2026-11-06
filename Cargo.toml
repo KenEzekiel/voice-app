@@ -3,6 +3,9 @@ name = "voice-app"
 version = "0.2.0"
 edition = "2024"
 publish = false
+license = "MIT"
+repository = "https://github.com/KenEzekiel/voice-app"
+description = "Experimental voice-driven desktop assistant for macOS"
 
 [dependencies]
 # Versioned snapshot of Zed 93d745668805029476e6d7fbb19652116fed51de.

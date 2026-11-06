@@ -24,13 +24,14 @@ import unicodedata
 
 # Native transcript packets can arrive late; inactivity is only a fallback, not VAD.
 TRANSCRIPT_IDLE_SECONDS = 2.0
+WORKER_MODEL = "gpt-6-luna"
 
 MAX_LINE = 8 * 1024 * 1024
 
 
 def running_app_target(text, apps):
     """Only an explicit, single app-switch command with one exact running match."""
-    match = re.fullmatch(r'(?:switch to|activate)\s+(?:the\s+)?(.+?)(?:\s+app)?[.!]?', text.strip(), re.IGNORECASE)
+    match = re.fullmatch(r'(?:switch to|activate|open|launch)\s+(?:the\s+)?(.+?)(?:\s+app)?[.!]?', text.strip(), re.IGNORECASE)
     if not match or not isinstance(apps, list):
         return None
     name = match[1].strip().casefold()
@@ -142,7 +143,8 @@ changes. Hand password entry and protected system dialogs to the user. Never rea
 credentials. Do not access Xendit confidential business information, customer or production
 data, or work credentials. If such content is visible, stop and ask the user to clear it.
 Do not infer approval for these actions from permission to control the desktop.
-For Stop do no work. Keep final spoken reports brief, factual, and specific.
+For Stop do no work. Report the verified outcome or exact blocker in one short sentence.
+Do not append a session debrief, checklist, headings, or an invitation for another task.
 """
 VOICE_INSTRUCTIONS = """You are the voice interface for a desktop assistant.
 For every desktop action, visible-screen question, correction, or continuation,
@@ -245,6 +247,11 @@ def argument_error(arguments):
             return "Unsupported " + name + ". Use one of: " + ", ".join(properties[name]["enum"])
         if expected == "array" and any(item not in properties[name]["items"]["enum"] for item in value):
             return "Unsupported keyboard modifier. Use command, shift, option, or control."
+    required = {'activate': 'pid', 'launchApp': 'bundleID', 'press': 'element',
+                'type': 'text', 'key': 'key', 'scroll': 'amount'}.get(arguments['operation'])
+    if required and required not in arguments:
+        return ('activate requires pid from the running apps list. To open an app by bundleID, use launchApp.'
+                if arguments['operation'] == 'activate' else 'Missing desktop argument: ' + required)
     if arguments.get("operation") != "observe":
         if "epoch" not in arguments or not arguments.get("revision"):
             return "Copy the epoch and nonempty revision from the latest screenshot's action context before acting. If unavailable, observe again; never invent them."
@@ -283,7 +290,7 @@ class SessionTrace:
     EVENTS = frozenset('''bridge_started bridge_ready bridge_closed task_failed
         rpc_requested rpc_completed rpc_failed rpc_closed native_requested native_completed native_failed
         voice_start_requested voice_connected voice_start_failed voice_end_requested voice_disconnected
-        native_exited speech_detected transcript_started transcript_finalized audio_output_received
+        native_exited speech_detector_ready speech_detector_failed speech_detector_unresponsive speech_handoff_blocked local_speech_started local_speech_ended speech_detected transcript_started transcript_finalized audio_output_received
         transcript_received transcript_duplicate transcript_partial transcript_preview transcript_stalled transcript_submitted
         transcript_waiting transcript_routed transcript_discarded request_received request_blocked
         cancellation_requested cancellation_settled observation_requested observation_completed
@@ -335,6 +342,12 @@ class SessionTrace:
             elif (key in ('inputTokens', 'cachedInputTokens', 'outputTokens', 'reasoningOutputTokens')
                   and type(value) is int and 0 <= value <= 1_000_000_000):
                 record[key] = value
+            elif key in ('speaking', 'finalized') and type(value) is bool:
+                record[key] = value
+            elif key in ('speechCount', 'finalizedSpeechCount') and type(value) is int and 0 <= value <= 1_000_000:
+                record[key] = value
+            elif key == 'quietSeconds' and type(value) in (int, float) and 0 <= value <= 3600 and math.isfinite(value):
+                record[key] = round(value, 3)
             elif key == 'success' and type(value) is bool:
                 record[key] = value
             elif key in ('hasCoordinates', 'hasElement') and type(value) is bool:
@@ -478,6 +491,29 @@ class NativeAudio:
                 raise
 
 
+class LocalAudio:
+    """Same audio controls, implemented by the signed on-device speech adapter."""
+    def __init__(self, ui):
+        self.ui = ui
+        self.changing = False
+        self.revision = 0
+        self.lock = asyncio.Lock()
+
+    async def exchange(self, message, expected=None):
+        async with self.lock:
+            self.changing = True
+            self.revision += 1
+            try:
+                controls = message['controls']
+                result = await self.ui('localSpeech', action='controls',
+                                       muted=controls['microphoneMuted'], suppressed=controls['speakerSuppressed'])
+                if not result.get('success'):
+                    raise RuntimeError(result.get('error', 'Local audio control failed.'))
+                return {'type': expected}
+            finally:
+                self.changing = False
+
+
 class Bridge:
     def __init__(self, trace=None, settings_path=None):
         self.trace = trace or SessionTrace()
@@ -501,11 +537,16 @@ class Bridge:
         self.submitted_items = {}
         self.hearing = False
         self.speech_paused_work = False
+        self.speech_monitor = None
+        self.acoustic_ready = False
+        self.acoustic_warning_item = None
         self.input_item = None
         self.input_text = ""
         self.input_preview = ""
         self.transcript_timer = None
         self.transcript_generation = 0
+        self.transcript_progress_at = None
+        self.transcript_watchdog_generation = 0
         self.interaction = 0
         self.stopped = True
         self.last_task = ""
@@ -514,7 +555,7 @@ class Bridge:
         self.voice_live = False
         self.speaker_suppressed = False
         self.tasks = set()
-        self.disabled_config = {}
+        self.disabled_config = {"project_doc_max_bytes": 0}
         self.cancelled_turns = set()
         self.completed_turns = set()
         self.turn_results = {}
@@ -525,8 +566,13 @@ class Bridge:
         self.trace_turns = {}
         self.settings_path = settings_path or Path.home() / 'Library/Application Support/Voice App/settings.json'
         self.idle_minutes = 5
+        self.speech_backend = 'apple'
+        self.local_submit_pending = False
         try:
-            minutes = json.loads(self.settings_path.read_text()).get('idleResetMinutes')
+            settings = json.loads(self.settings_path.read_text())
+            if settings.get('speechBackend') == 'native':
+                self.speech_backend = 'native'  # Explicit opt-in for the previous subscription voice path.
+            minutes = settings.get('idleResetMinutes')
             if type(minutes) is int and 1 <= minutes <= 60:
                 self.idle_minutes = minutes
         except (OSError, ValueError, AttributeError):
@@ -583,16 +629,19 @@ class Bridge:
         future = asyncio.get_running_loop().create_future()
         self.ui_pending[ident] = future
         interaction = self.interaction
-        self.trace.record('desktop_requested', operation=operation, request=ident, interaction=interaction)
+        if operation not in ('speechActivity', 'localSpeech'):
+            self.trace.record('desktop_requested', operation=operation, request=ident, interaction=interaction)
         emit("desktop", id=ident, operation=operation, **params)
         try:
             result = await asyncio.wait_for(future, 10)
-            self.trace.record('desktop_completed', operation=operation, request=ident,
+            if operation not in ('speechActivity', 'localSpeech'):
+                self.trace.record('desktop_completed', operation=operation, request=ident,
                               interaction=interaction, success=result.get('success') is True,
                               code=None if result.get('success') else 'rejected')
             return result
         except (Exception, asyncio.CancelledError) as error:
-            self.trace.record('desktop_failed', operation=operation, request=ident,
+            if operation not in ('speechActivity', 'localSpeech'):
+                self.trace.record('desktop_failed', operation=operation, request=ident,
                               interaction=interaction, code=error_code(error))
             raise
         finally:
@@ -612,9 +661,14 @@ class Bridge:
             raise RuntimeError("Realtime endpoint overrides are excluded.")
         # Disable all inherited MCP connections for these two scoped threads.
         self.disabled_config = {"mcp_servers." + name + ".enabled": False for name in config.get("mcp_servers", {})}
-        voices = await self.rpc.request("thread/realtime/listVoices", {})
-        if not voices.get("voices", {}).get("v3"):
-            raise RuntimeError("This Codex account/version does not expose native V3 voice.")
+        # The desktop worker has its own complete task and privacy instructions.
+        # Coding skills and repository instructions have no consumer in this app.
+        self.disabled_config["project_doc_max_bytes"] = 0
+        self.disabled_config["skills.include_instructions"] = False
+        if self.speech_backend == 'native':
+            voices = await self.rpc.request("thread/realtime/listVoices", {})
+            if not voices.get("voices", {}).get("v3"):
+                raise RuntimeError("This Codex account/version does not expose native V3 voice.")
         return account
 
     async def boot(self):
@@ -641,7 +695,7 @@ class Bridge:
         self.rpc.send({"method": "initialized"})
         account = await self.authenticate()
         self.trace.record('bridge_ready')
-        emit("ready", email=account["email"], plan=account.get("planType", "unknown"), version=manifest["version"], idleResetMinutes=self.idle_minutes)
+        emit("ready", email=account["email"], plan=account.get("planType", "unknown"), version=manifest["version"], idleResetMinutes=self.idle_minutes, speechBackend=self.speech_backend)
 
     @asynccontextmanager
     async def voice_transition(self):
@@ -662,6 +716,8 @@ class Bridge:
                 raise
 
     async def open_voice(self, expected, *, reuse_worker=False, muted=False):
+        if self.speech_backend == 'apple':
+            return await self.open_local_voice(expected, reuse_worker=reuse_worker, muted=muted)
         if self.voice_live or self.native:
             raise RuntimeError("Voice is already attached; end it before reconnecting.")
         while not self.voice_events.empty():
@@ -721,6 +777,10 @@ class Bridge:
         await self.native.exchange({"type": "openDevices", "selection": {}}, "devicesOpened")
         await self.controls(muted, True)
         self.voice_live = True
+        if self.speech_monitor:
+            self.speech_monitor.cancel()
+            await asyncio.gather(self.speech_monitor, return_exceptions=True)
+        self.speech_monitor = self.spawn(self.monitor_speech())
         self.spawn(self.watch_native(self.native))
         if not reuse_worker:
             self.stopped = False
@@ -736,6 +796,102 @@ class Bridge:
         else:
             emit("voice", state="listening", message="Listening. Replies appear in captions. Play reply pauses the mic; Listen again resumes it.")
 
+    async def open_local_voice(self, expected, *, reuse_worker=False, muted=False):
+        if self.voice_live or self.native:
+            raise RuntimeError('Speech is already connected.')
+        ticket = self.interaction
+        await self.authenticate(expected)
+        if ticket != self.interaction:
+            raise asyncio.CancelledError()
+        self.expected_account = expected
+        if not reuse_worker:
+            self.worker_thread = await self.start_thread(WORKER_INSTRUCTIONS, [TOOL])
+        result = await self.ui('localSpeech', action='start', muted=muted)
+        if not result.get('success'):
+            raise RuntimeError(result.get('error', 'Apple speech startup failed. No cloud speech fallback was used.'))
+        if ticket != self.interaction:
+            await self.ui('localSpeech', action='stop')
+            raise asyncio.CancelledError()
+        self.native = LocalAudio(self.ui)
+        self.session = str(uuid.uuid4())
+        self.voice_thread = 'local-' + self.session
+        self.voice_live = True
+        self.microphone_muted, self.speaker_suppressed = muted, True
+        if not reuse_worker:
+            self.stopped = False
+        emit('audioControls', muted=muted, suppressed=True)
+        emit('connection', state='connected')
+        emit('voice', state='paused' if muted else 'listening',
+             message='Microphone muted.' if muted else 'Listening on device · Apple speech · English')
+        self.trace.record('voice_connected', interaction=self.interaction)
+        self.speech_monitor = self.spawn(self.monitor_local_speech())
+        self.idle_activity()
+
+    async def monitor_local_speech(self):
+        last_version = None
+        waiting_reported = False
+        while self.voice_live and isinstance(self.native, LocalAudio):
+            native = self.native
+            if native.changing:
+                await asyncio.sleep(0.075)
+                continue
+            revision = native.revision
+            result = await self.ui('localSpeech', action='status')
+            if native is not self.native or not self.voice_live or native.changing or revision != native.revision:
+                continue
+            if not result.get('success'):
+                await self.ui('pause')
+                self.stopped = True
+                raise RuntimeError(result.get('error', 'Local speech stopped. Restart session to retry.'))
+            if not self.microphone_muted and not self.stopped:
+                text = caption_text(result.get('text', ''))
+                if text and not self.hearing:
+                    self.hearing = True
+                    self.spawn(self.on_speech())
+                if result.get('version') != last_version:
+                    last_version = result.get('version')
+                    self.input_text = text
+                    if text:
+                        self.transcript_progress_at = time.monotonic()
+                        if waiting_reported:
+                            emit('voice', state='hearing', message='Hearing you. Desktop work is paused until you finish.')
+                        waiting_reported = False
+                        self.trace.record('transcript_partial', role='user', interaction=self.interaction)
+                        emit('transcript', role='user', text=text, partial=True)
+                if (text and not result.get('ready') and not waiting_reported
+                        and self.transcript_progress_at is not None
+                        and time.monotonic() - self.transcript_progress_at >= 4):
+                    waiting_reported = True
+                    self.trace.record('speech_handoff_blocked', interaction=self.interaction,
+                        **{key: result.get(key) for key in ('speaking', 'quietSeconds', 'speechCount', 'finalized', 'finalizedSpeechCount')})
+                    emit('voice', state='transcribing', message='Waiting for speech to finish. Choose Send heard request if you are done.')
+                if text and result.get('ready') and not self.local_submit_pending:
+                    self.spawn(self.submit_local_request())
+            await asyncio.sleep(0.075)
+
+    async def submit_local_request(self, manual=False):
+        if self.local_submit_pending or not self.voice_live or self.microphone_muted or self.stopped:
+            return
+        self.local_submit_pending = True
+        ticket, session = self.interaction, self.session
+        try:
+            result = await self.ui('localSpeech', action='status')
+            text = caption_text(result.get('text', ''))
+            if not result.get('success') or not text or (not manual and not result.get('ready')):
+                return
+            consumed = await self.ui('localSpeech', action='consume', version=result['version'], manual=manual)
+            if (not consumed.get('success') or ticket != self.interaction or session != self.session
+                    or self.stopped or self.microphone_muted or not self.voice_live):
+                return
+            self.input_text = self.input_preview = ''
+            self.hearing = False
+            emit('transcript', role='user', text=text)
+            self.trace.record('transcript_submitted', interaction=self.interaction)
+            # Do not block the microphone monitor while the worker starts or cancels.
+            self.spawn(self.voice_utterance(text, self.voice_thread, session))
+        finally:
+            self.local_submit_pending = False
+
     async def resume_microphone(self, *, reset_generation=None, muted=False):
         # Native transcript segments can span a mute. There is no protocol
         # input-buffer reset: use a fresh relay session to exclude buffered
@@ -750,6 +906,25 @@ class Bridge:
                 await self.quiesce()
                 if reset_generation != self.idle_generation:
                     return False
+            if isinstance(self.native, LocalAudio):
+                if reset_generation is None:
+                    return await self.change_controls(muted, True)
+                await self.ui('localSpeech', action='stop')
+                self.voice_live = False; self.native = None
+                if self.speech_monitor:
+                    self.speech_monitor.cancel()
+                    await asyncio.gather(self.speech_monitor, return_exceptions=True)
+                    self.speech_monitor = None
+                self.last_task = ''; self.last_local_result = None; self.reply = None
+                self.worker_thread = None; self.hearing = False
+                self.input_text = self.input_preview = ''
+                self.turn_results.clear(); self.cancelled_turns.clear(); self.completed_turns.clear()
+                emit('sessionReset')
+                await self.open_local_voice(self.expected_account, muted=muted)
+                self.session_dirty = False
+                self.cancel_idle()
+                self.trace.record('session_reset_completed', interaction=self.interaction)
+                return True
             native, thread, expected = self.native, self.voice_thread, self.expected_account
             self.cancel_idle()
             self.cancel_transcript_submit()
@@ -796,11 +971,14 @@ class Bridge:
     async def start_thread(self, instructions, tools, ephemeral=True):
         result = await self.rpc.request("thread/start", {"ephemeral": ephemeral,
             "cwd": str(Path.cwd()), "approvalPolicy": "untrusted", "sandbox": "read-only",
-            "modelProvider": "openai", "developerInstructions": instructions,
+            "modelProvider": "openai", "model": WORKER_MODEL if tools else None,
+            "baseInstructions": instructions, "developerInstructions": "",
             "dynamicTools": tools, "config": self.disabled_config,
             "environments": []})
         if result.get("modelProvider") != "openai":
             raise RuntimeError("Thread provider mismatch.")
+        if tools and result.get("model") != WORKER_MODEL:
+            raise RuntimeError("Requested desktop worker model is unavailable. No alternate model was used.")
         return result["thread"]["id"]
 
     async def controls(self, muted, suppressed):
@@ -840,8 +1018,15 @@ class Bridge:
             if self.active_turn:
                 turn = self.active_turn
                 self.cancelled_turns.add(turn)
-                await self.rpc.request("turn/interrupt", {"threadId": self.worker_thread, "turnId": turn}, timeout=5)
-                await asyncio.wait_for(self.turn_done.wait(), 10)
+                try:
+                    await self.rpc.request("turn/interrupt", {"threadId": self.worker_thread, "turnId": turn}, timeout=5)
+                except Exception:
+                    # The terminal event can win the race with interrupt's reply.
+                    # Only that exact turn's observed completion settles failure.
+                    if turn not in self.completed_turns:
+                        raise
+                if turn not in self.completed_turns:
+                    await asyncio.wait_for(self.turn_done.wait(), 10)
         self.trace.record('cancellation_settled', interaction=self.interaction)
 
     async def quiesce(self, sticky=False, announce=None):
@@ -868,19 +1053,64 @@ class Bridge:
         # No dependence on a model deciding whether the utterance is a correction.
         await self.quiesce(announce="Hearing you. Desktop work is paused until you finish.")
         if self.hearing and not self.stopped and not self.microphone_muted:
-            emit("voice", state="hearing", message="Hearing you. Captions appear as native voice recognizes words.")
+            emit("voice", state="hearing", message="Hearing you. Desktop work is paused until you finish.")
 
     async def transcript_watchdog(self, key):
-        await asyncio.sleep(8)
-        if self.hearing and self.input_item == key and self.voice_live and not self.stopped and not self.microphone_muted:
+        if (not self.hearing or self.input_item != key or not self.voice_live
+                or self.stopped or self.microphone_muted):
+            return
+        self.transcript_watchdog_generation += 1
+        generation = self.transcript_watchdog_generation
+        while True:
+            progress = self.transcript_progress_at
+            delay = 8 if progress is None else max(0, progress + 8 - time.monotonic())
+            await asyncio.sleep(delay)
+            if (generation != self.transcript_watchdog_generation or not self.hearing
+                    or self.input_item != key or not self.voice_live or self.stopped or self.microphone_muted):
+                return
+            if self.transcript_progress_at is not None and self.transcript_progress_at + 8 - time.monotonic() > 0.000001:
+                continue
             self.trace.record('transcript_stalled', interaction=self.interaction)
             emit("voice", state="transcribing", message="Still waiting for native voice to finish this transcript. If the caption is correct, choose Send heard request. If no words appear, end voice and reconnect.")
+            return
 
     def cancel_transcript_submit(self):
         self.transcript_generation += 1
         if self.transcript_timer:
             self.transcript_timer.cancel()
             self.transcript_timer = None
+
+    async def monitor_speech(self):
+        active = None
+        try:
+            while self.voice_live:
+                enabled = not self.microphone_muted and not self.stopped
+                result = await self.ui('speechActivity', enabled=enabled)
+                self.acoustic_ready = enabled and result.get('success') is True and result.get('available') is True
+                if enabled and not self.acoustic_ready:
+                    self.trace.record('speech_detector_failed')
+                    self.cancel_transcript_submit()
+                    detail = (' (' + result['stage'] + ': ' + str(result['code']) + ')'
+                              if result.get('stage') in ('deviceDetection',) and type(result.get('code')) is int else '')
+                    emit('actionFailure', message='Local speech detection is unavailable' + detail + '. Auto-send is paused; use Send heard request.')
+                    return
+                if self.acoustic_ready:
+                    speaking = result.get('speaking') is True
+                    if active is None:
+                        self.trace.record('speech_detector_ready')
+                    if speaking != active and (speaking or active is True):
+                        self.trace.record('local_speech_started' if speaking else 'local_speech_ended')
+                    active = speaking
+                    if speaking:
+                        self.cancel_transcript_submit()
+                    elif self.input_text and self.transcript_timer is None:
+                        self.arm_transcript_submit()
+                else:
+                    active = None
+                await asyncio.sleep(0.1)
+        finally:
+            self.acoustic_ready = False
+            await self.ui('speechActivity', enabled=False)
 
     def arm_transcript_submit(self):
         self.cancel_transcript_submit()
@@ -894,9 +1124,31 @@ class Bridge:
         self.transcript_timer = asyncio.get_running_loop().call_later(TRANSCRIPT_IDLE_SECONDS, ready)
 
     async def submit_heard_request(self, key=None, text=None, generation=None):
+        if isinstance(self.native, LocalAudio):
+            return await self.submit_local_request(manual=generation is None)
         if (not self.voice_live or self.microphone_muted or self.stopped
                 or not self.input_item or not self.input_text.strip()):
             return
+        if generation is not None:
+            # Caption inactivity is not acoustic silence. Recheck the local
+            # detector at dispatch time so a queued timer cannot cut off speech.
+            if not self.acoustic_ready:
+                return
+            activity = await self.ui('speechActivity', enabled=True)
+            if (activity.get('success') is True and activity.get('available') is True
+                    and activity.get('speechCount', 0) == 0
+                    and key in (None, self.input_item)
+                    and generation == self.transcript_generation
+                    and not self.microphone_muted and not self.stopped and self.voice_live
+                    and self.acoustic_warning_item != self.input_item):
+                self.acoustic_warning_item = self.input_item
+                self.trace.record('speech_detector_unresponsive', interaction=self.interaction)
+                emit('voice', state='transcribing', message='Captions received, but local speech detection has not confirmed this turn. Choose Send heard request when you finish.')
+            if (not activity.get('success') or not activity.get('available')
+                    or activity.get('speaking') or activity.get('speechCount', 0) < 1
+                    or activity.get('quietSeconds', 0) < 1.2
+                    or self.microphone_muted or self.stopped or not self.voice_live):
+                return
         if key is not None and (key != self.input_item or text != self.input_text):
             return
         if generation is not None and generation != self.transcript_generation:
@@ -906,6 +1158,7 @@ class Bridge:
             emit('voice', state='transcribing', message='Waiting for recognized speech to finish syncing. Your request has not been sent.')
             return
         self.cancel_transcript_submit()
+        self.acoustic_warning_item = None
         self.trace.record('transcript_submitted', interaction=self.interaction)
         key, text = self.input_item, self.input_text
         self.submitted_items[key] = self.submitted_items.get(key, '') + text
@@ -1158,6 +1411,7 @@ class Bridge:
                 preview = caption_text(self.input_preview)
                 if not preview:
                     return
+                self.transcript_progress_at = time.monotonic()
                 self.trace.record('transcript_preview', role='user', interaction=self.interaction)
                 emit('transcript', role='user', text=preview, partial=True)
                 if not self.hearing:
@@ -1180,6 +1434,7 @@ class Bridge:
                 if key != self.input_item:
                     self.input_item = key
                     self.input_text = item.get('text', '')
+                    self.transcript_progress_at = time.monotonic()
                     if not self.input_preview and caption_text(self.input_text):
                         emit('transcript', role='user', text=caption_text(self.input_text), partial=True)
                     self.arm_transcript_submit()
@@ -1199,12 +1454,15 @@ class Bridge:
                     self.spawn(self.transcript_watchdog(self.input_item))
                 self.trace.record('transcript_partial', role='user', interaction=self.interaction)
                 self.input_text += delta
+                if delta:
+                    self.transcript_progress_at = time.monotonic()
                 if not self.input_preview and caption_text(self.input_text):
                     emit('transcript', role='user', text=caption_text(self.input_text), partial=True)
                 self.arm_transcript_submit()
             raw_start = method == "thread/realtime/itemAdded" and item.get("type") == "input_audio_buffer.speech_started"
             if raw_start:
                 self.cancel_transcript_submit()
+                self.transcript_progress_at = time.monotonic()
             if (canonical_start or raw_start) and not self.hearing:
                 self.hearing = True
                 self.spawn(self.on_speech())
@@ -1301,7 +1559,12 @@ class Bridge:
             self.trace.record('speech_suppressed', interaction=ticket)
             return
         self.trace.record('speech_requested', interaction=ticket, turn=self.trace_turn(turn))
-        await self.rpc.request("thread/realtime/appendSpeech", {"threadId": self.voice_thread, "text": text[:4000]})
+        if isinstance(self.native, LocalAudio):
+            result = await self.ui('localSpeech', action='speak', text=text[:2000])
+            if not result.get('success'):
+                raise RuntimeError('Local reply playback failed.')
+        else:
+            await self.rpc.request("thread/realtime/appendSpeech", {"threadId": self.voice_thread, "text": text[:4000]})
         self.trace.record('speech_accepted', interaction=ticket, turn=self.trace_turn(turn))
 
     async def end_voice(self):
@@ -1319,6 +1582,11 @@ class Bridge:
         self.cancel_transcript_submit()
         self.stopped = True
         self.voice_live = False
+        if self.speech_monitor:
+            self.speech_monitor.cancel()
+            await asyncio.gather(self.speech_monitor, return_exceptions=True)
+            self.speech_monitor = None
+        self.acoustic_ready = False
         self.reply = None
         self.hearing = False
         self.input_item = None
@@ -1329,7 +1597,11 @@ class Bridge:
             emit("connection", state="disconnecting")
             emit("localStop")
         # Terminate capture independently of Codex cancellation/response time.
-        if self.native:
+        local = isinstance(self.native, LocalAudio)
+        if local or self.speech_backend == 'apple':
+            await self.ui('localSpeech', action='stop')
+            self.native = None
+        elif self.native:
             await terminate(self.native.process)
             self.native = None
         try:
@@ -1338,7 +1610,7 @@ class Bridge:
             if not announce:
                 raise
             emit("failure", message="Worker cancellation did not settle. Work stays stopped; restart Voice App.")
-        if self.voice_thread:
+        if self.voice_thread and self.speech_backend == 'native':
             try:
                 await self.rpc.request("thread/realtime/stop", {"threadId": self.voice_thread}, timeout=5)
             except Exception:
@@ -1436,7 +1708,7 @@ class Bridge:
                 try:
                     self.settings_path.parent.mkdir(parents=True, exist_ok=True)
                     pending = self.settings_path.with_suffix('.tmp')
-                    pending.write_text(json.dumps({'idleResetMinutes':minutes}) + '\n')
+                    pending.write_text(json.dumps({'idleResetMinutes':minutes, 'speechBackend':self.speech_backend}) + '\n')
                     pending.replace(self.settings_path)
                     self.idle_minutes = minutes
                     self.idle_activity()
@@ -1534,8 +1806,12 @@ class Bridge:
             self.spawn(self.command(command))
 
     async def close(self):
+        self.stopped = True
+        self.voice_live = False
         self.cancel_idle()
         self.cancel_transcript_submit()
+        if isinstance(self.native, LocalAudio):
+            await self.ui('localSpeech', action='stop')
         for task in list(self.tasks):
             task.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)

@@ -1,6 +1,91 @@
 import AppKit
 import ApplicationServices
 import AVFoundation
+import CoreAudio
+
+// Reads Apple's on-device VAD state; never opens a second audio stream.
+private final class LocalSpeechActivity {
+    private let queue = DispatchQueue(label: "voice-app.speech-activity")
+    private var device = AudioDeviceID(0)
+    private var previousEnable: UInt32 = 0
+    private var listener: AudioObjectPropertyListenerBlock?
+    private var speaking = false
+    private var speechCount = 0
+    private var endedAt: TimeInterval?
+
+    private func address(_ selector: AudioObjectPropertySelector) -> AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress(mSelector: selector, mScope: kAudioDevicePropertyScopeInput,
+                                   mElement: kAudioObjectPropertyElementMain)
+    }
+    @discardableResult private func updateState() -> OSStatus {
+        var property = address(kAudioDevicePropertyVoiceActivityDetectionState)
+        var value: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        guard device != 0 else { return kAudioHardwareBadObjectError }
+        let status = AudioObjectGetPropertyData(device, &property, 0, nil, &size, &value)
+        guard status == noErr else { speaking = true; endedAt = nil; return status }
+        let next = value != 0
+        if next && !speaking { speechCount += 1; endedAt = nil }
+        if !next && speaking { endedAt = ProcessInfo.processInfo.systemUptime }
+        speaking = next
+        return noErr
+    }
+    private func stop() {
+        if device != 0 {
+            var property = address(kAudioDevicePropertyVoiceActivityDetectionState)
+            if let listener = listener { AudioObjectRemovePropertyListenerBlock(device, &property, queue, listener) }
+            if previousEnable == 0 {
+                property = address(kAudioDevicePropertyVoiceActivityDetectionEnable)
+                var value: UInt32 = 0
+                AudioObjectSetPropertyData(device, &property, 0, nil, UInt32(MemoryLayout<UInt32>.size), &value)
+            }
+        }
+        device = 0; listener = nil; speaking = false; speechCount = 0; endedAt = nil
+    }
+    func request(enabled: Bool, reply: @escaping ([String: Any]) -> Void) {
+        queue.async {
+            if !enabled { self.stop(); reply(["success": true, "available": false]); return }
+            var inputProperty = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultInputDevice,
+                mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+            var input = AudioDeviceID(0)
+            var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+            var status = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &inputProperty, 0, nil, &size, &input)
+            if input != self.device { self.stop() }
+            if status == noErr && input != 0 && self.device == 0 {
+                var property = self.address(kAudioDevicePropertyVoiceActivityDetectionEnable)
+                var previous: UInt32 = 0
+                size = UInt32(MemoryLayout<UInt32>.size)
+                status = AudioObjectGetPropertyData(input, &property, 0, nil, &size, &previous)
+                if status == noErr {
+                    var enable: UInt32 = 1
+                    status = AudioObjectSetPropertyData(input, &property, 0, nil, size, &enable)
+                    if status == noErr {
+                        self.device = input; self.previousEnable = previous
+                        property = self.address(kAudioDevicePropertyVoiceActivityDetectionState)
+                        let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+                            guard let self = self, self.device == input else { return }
+                            self.updateState()
+                        }
+                        self.listener = listener
+                        status = AudioObjectAddPropertyListenerBlock(input, &property, self.queue, listener)
+                    }
+                }
+            }
+            guard status == noErr, self.device != 0 else {
+                self.stop()
+                reply(["success": false, "available": false, "stage": "deviceDetection", "code": Int(status)]); return
+            }
+            status = self.updateState()
+            guard status == noErr else {
+                self.stop(); reply(["success": false, "available": false, "stage": "deviceDetection", "code": Int(status)]); return
+            }
+            reply(["success": true, "available": true, "speaking": self.speaking,
+                "speechCount": self.speechCount,
+                "quietSeconds": self.endedAt.map { ProcessInfo.processInfo.systemUptime - $0 } ?? 0])
+        }
+    }
+}
+private let localSpeechActivity = LocalSpeechActivity()
 
 struct CaptionEntrance {
     static let duration = 0.2
@@ -322,6 +407,8 @@ private final class DesktopController {
             let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
             return ["success": AXIsProcessTrustedWithOptions(options)]
         case "shutdown":
+            if #available(macOS 26.0, *) { Task { @MainActor in await LocalSpeechEngine.shared.stop() } }
+            localSpeechActivity.request(enabled: false) { _ in }
             DispatchQueue.main.async { self.updateCaptions([:]); self.previewPanel?.orderOut(nil) }
             gate.pause(sticky: true); worker.cursor.hide(); worker.setSharing(false); gate.flushAudit()
             return ["success": true]
@@ -356,7 +443,20 @@ public typealias DesktopReply = @convention(c) (UnsafePointer<CChar>?, UnsafeMut
 public func voiceDesktopRequest(_ raw: UnsafePointer<CChar>?, _ reply: DesktopReply?, _ context: UnsafeMutableRawPointer?) {
     guard let reply = reply else { return }
     let request = parse(raw)
-    if request["operation"] as? String == "microphone" {
+    if request["operation"] as? String == "localSpeech" {
+        if #available(macOS 26.0, *) {
+            Task { @MainActor in
+                let result = await LocalSpeechEngine.shared.request(request)
+                json(result).withCString { reply($0, context) }
+            }
+        } else {
+            json(["success": false, "error": "Apple local speech requires macOS 26 or later. No cloud speech fallback was used."]).withCString { reply($0, context) }
+        }
+    } else if request["operation"] as? String == "speechActivity" {
+        localSpeechActivity.request(enabled: request["enabled"] as? Bool ?? false) { result in
+            json(result).withCString { reply($0, context) }
+        }
+    } else if request["operation"] as? String == "microphone" {
         AVCaptureDevice.requestAccess(for: .audio) { granted in
             json(["success": granted, "error": granted ? "" : "Allow Microphone for Voice App in System Settings."])
                 .withCString { reply($0, context) }
