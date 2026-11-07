@@ -560,6 +560,7 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
                     'generation':trial * 2 + 1,'expectedAccount':'test'}))
                 await asyncio.wait_for(entered.wait(), 1)
                 await asyncio.wait_for(self.b.command({'type':'session','action':'stop','generation':trial * 2 + 2}), 1)
+                self.assertIsNone(self.b.lifecycle_task, 'Completed lifecycle must release its caller task')
                 await asyncio.gather(start, return_exceptions=True)
             hold = False
             await self.b.command({'type':'session','action':'start','generation':21,'expectedAccount':'test'})

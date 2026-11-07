@@ -1679,6 +1679,12 @@ class Bridge:
                      message=('Session stopped locally, but cleanup did not settle. Restart Voice App.' if action == 'stop' else
                               'Session could not start. Choose Start session to retry with a fresh native connection. No API fallback was attempted.'))
 
+        finally:
+            # The caller may await several commands in one long-lived task.
+            # Only an active lifecycle operation can be cancelled by its successor.
+            if self.lifecycle_task is asyncio.current_task():
+                self.lifecycle_task = None
+
     async def recycle_server(self):
         # A canceled/failed WebRTC setup can leave connection state in app-server.
         # Recreate it on the next explicit Start, never retry a failed start in a loop.
