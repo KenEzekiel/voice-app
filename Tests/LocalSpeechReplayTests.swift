@@ -11,6 +11,16 @@ import Foundation
         let began = ProcessInfo.processInfo.systemUptime
         try await speech.start(muted: false, inputFile: file)
         let prepared = ProcessInfo.processInfo.systemUptime
+        if CommandLine.arguments.contains("--passive") {
+            // No status reads while the file plays: recognition must advance itself.
+            try await Task.sleep(nanoseconds: UInt64((duration + 1.2) * 1_000_000_000))
+            let unpolled = speech.snapshot()
+            guard unpolled["ready"] as? Bool == true else {
+                print("FAIL: speech did not finalize without status polling")
+                await speech.stop()
+                exit(1)
+            }
+        }
         var firstCaption: Double?
         var heard: [String] = []
         var readyTimes: [Double] = []
@@ -53,6 +63,11 @@ import Foundation
             "speechCount": speechCount,
             "proof": "Production Apple transcription, conversion, acoustic clock and finalization; generated file paced in real time. No microphone or desktop input."]
         await speech.stop()
+        let stoppedVersion = speech.snapshot()["version"] as? Int
+        try await Task.sleep(nanoseconds: 200_000_000)
+        let stopped = speech.snapshot()
+        precondition(stopped["success"] as? Bool == false && stopped["ready"] as? Bool == false)
+        precondition(stopped["version"] as? Int == stoppedVersion, "Stopped tasks changed caption state")
         let data = try JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys])
         FileHandle.standardOutput.write(data + Data([10]))
         if result["passed"] as? Bool != true { exit(1) }

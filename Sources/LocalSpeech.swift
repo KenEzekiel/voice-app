@@ -12,16 +12,20 @@ struct SpeechCaptionBuffer {
     }
     private(set) var segments: [Segment] = []
     private(set) var consumedThrough: Double = -1
-    var text: String { segments.sorted { $0.start < $1.start }.map(\.text).joined() }
-    var finalized: Bool { !segments.isEmpty && segments.allSatisfy(\.final) }
+    private(set) var text = ""
+    private(set) var finalized = false
     mutating func update(start: Double, end: Double, text: String, final: Bool) {
         guard start.isFinite, end.isFinite, end > start, start >= consumedThrough - 0.0001 else { return }
         segments.removeAll { $0.start < end && $0.end > start }
         segments.append(Segment(start: start, end: end, text: text, final: final))
+        segments.sort { $0.start < $1.start }
+        self.text = segments.map(\.text).joined()
+        finalized = segments.allSatisfy(\.final)
     }
     mutating func consume() {
         consumedThrough = max(consumedThrough, segments.map(\.end).max() ?? consumedThrough)
         segments.removeAll()
+        text = ""; finalized = false
     }
 }
 
@@ -73,6 +77,7 @@ struct SpeechActivityClock {
     private var continuation: AsyncStream<AnalyzerInput>.Continuation?
     private var transcripts: Task<Void, Never>?
     private var finalizer: Task<Void, Never>?
+    private var maintenance: Task<Void, Never>?
     private var fixtureFeed: Task<Void, Never>?
     private var generation = 0
     private var caption = SpeechCaptionBuffer()
@@ -92,12 +97,14 @@ struct SpeechActivityClock {
         failure = message
         engine?.stop()
         active = false
+        maintenance?.cancel(); maintenance = nil
     }
     func stop() async {
         generation += 1
         active = false; muted = true
         engine?.stop(); engine?.inputNode.removeTap(onBus: 0); engine = nil
         continuation?.finish(); continuation = nil
+        maintenance?.cancel(); maintenance = nil
         transcripts?.cancel(); finalizer?.cancel(); fixtureFeed?.cancel()
         transcripts = nil; finalizer = nil; fixtureFeed = nil
         let previous = analyzer; analyzer = nil
@@ -209,8 +216,17 @@ struct SpeechActivityClock {
         }
         lastFrameAt = ProcessInfo.processInfo.systemUptime
         active = true
+        maintenance = Task { [weak self] in
+            while !Task.isCancelled {
+                do { try await Task.sleep(nanoseconds: 75_000_000) }
+                catch { return }
+                guard let self = self, self.generation == ticket, self.active else { return }
+                self.advance()
+            }
+        }
     }
-    func snapshot() -> [String: Any] {
+    // Recognition owns progress; reading status never schedules or mutates work.
+    private func advance() {
         if active && !muted && ProcessInfo.processInfo.systemUptime - lastFrameAt > 1.5 {
             fail("Microphone stopped delivering audio. Restart session to retry.", generation: generation)
         }
@@ -226,6 +242,9 @@ struct SpeechActivityClock {
                 } catch { self?.fail("Local speech could not finalize this request. Restart session to retry.", generation: ticket) }
             }
         }
+    }
+    func snapshot() -> [String: Any] {
+        let quiet = clock.quietSeconds(now: ProcessInfo.processInfo.systemUptime)
         return ["success": failure == nil && active, "error": failure ?? "", "backend": "apple",
             "muted": muted, "speaking": clock.speaking, "speechCount": clock.speechCount, "quietSeconds": quiet,
             "text": caption.text, "version": captionVersion,
